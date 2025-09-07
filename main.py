@@ -9,19 +9,22 @@ from langchain_core.messages import HumanMessage
 from langchain.prompts import PromptTemplate
 from langchain_community.document_loaders import TextLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import OllamaEmbeddings
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.documents import Document
 from langchain.chains import create_retrieval_chain
-from langchain_community.vectorstores import FAISS
 import json
+import pymongo
+from chromadb import HttpClient
+from chromadb.utils import embedding_functions
 from llm_provider import get_llm
+from urllib.parse import quote_plus
+from dotenv import load_dotenv
+
+# Load environment variables from .env file for local testing
+# This line should be commented out or removed for production on Render
+load_dotenv() 
 
 app = FastAPI()
-
-# In-memory storage for resumes and vector store
-in_memory_db = {}
-vector_store = None
 
 # Configure CORS
 origins = ["*"]
@@ -32,6 +35,36 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- Database & Vector Store Initialization ---
+# MongoDB Client
+mongo_uri = os.getenv("MONGO_URI")
+if not mongo_uri:
+    raise ValueError("MONGO_URI environment variable not set.")
+mongo_client = pymongo.MongoClient(mongo_uri)
+db = mongo_client["resume_db"]
+resumes_collection = db["resumes"]
+
+# ChromaDB Client & Collection
+hf_api_key = os.getenv("HF_API_KEY")
+if not hf_api_key:
+    raise ValueError("HF_API_KEY environment variable not set.")
+huggingface_ef = embedding_functions.HuggingFaceEmbeddingFunction(
+    api_key=hf_api_key,
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+# The ChromaDB client will connect to a separate service, e.g., on Render
+# For this setup, we assume a standalone ChromaDB instance is running
+chroma_client = HttpClient(host=os.getenv("CHROMA_HOST", "localhost"), port=os.getenv("CHROMA_PORT", 8000))
+
+# Try to get the collection, create it if it doesn't exist
+try:
+    vector_collection = chroma_client.get_collection(name="resume_vectors", embedding_function=huggingface_ef)
+except Exception:
+    vector_collection = chroma_client.create_collection(name="resume_vectors", embedding_function=huggingface_ef)
+
+# --- Helper Functions ---
 
 def extract_text_from_file(file: UploadFile) -> str:
     """Extracts text from a given file based on its content type."""
@@ -71,40 +104,7 @@ def generate_markdown_with_llm(extracted_data: dict):
     response = llm.invoke([HumanMessage(content=prompt)])
     return response.content
 
-def update_vector_store(text_content, resume_id):
-    """Updates the in-memory vector store with the new resume text."""
-    global vector_store
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    docs = [Document(page_content=text, metadata={"source": resume_id})]
-    split_documents = text_splitter.split_documents(docs)
-    embeddings = OllamaEmbeddings(model="llama3:8b")
-    
-    if vector_store:
-        vector_store.add_documents(split_documents)
-    else:
-        vector_store = FAISS.from_documents(split_documents, embeddings)
-
-def rag_query(query: str):
-    """Performs a RAG query against the in-memory vector store."""
-    if not vector_store:
-        return "No resumes have been processed yet. Please upload a resume first."
-    
-    llm = get_llm()
-    retriever = vector_store.as_retriever()
-    
-    prompt = PromptTemplate.from_template("""
-    You are a helpful assistant who answers questions about resumes.
-    Use the following context to answer the user's question.
-    If you don't know the answer, just say you don't have enough information.
-    Context: {context}
-    Question: {input}
-    """)
-    
-    document_chain = create_stuff_documents_chain(llm, prompt)
-    retrieval_chain = create_retrieval_chain(retriever, document_chain)
-    
-    response = retrieval_chain.invoke({"input": query})
-    return response['answer']
+# --- API Endpoints ---
 
 @app.post("/api/process")
 async def process_resume_endpoint(resume_file: UploadFile = File(...), user_id: str = Form(...)):
@@ -114,18 +114,29 @@ async def process_resume_endpoint(resume_file: UploadFile = File(...), user_id: 
         extracted_data = extract_data_with_llm(resume_text)
         markdown_content = generate_markdown_with_llm(extracted_data)
         
-        # In-memory storage with a unique ID
-        resume_id = f"resume_{len(in_memory_db) + 1}"
-        in_memory_db[resume_id] = {
-            "id": resume_id,
+        # Save to MongoDB
+        resume_doc = {
             "user_id": user_id,
             "extracted_data": extracted_data,
             "markdown_content": markdown_content,
             "original_text": resume_text,
         }
+        result = resumes_collection.insert_one(resume_doc)
+        resume_id = str(result.inserted_id)
         
-        # Update RAG model
-        update_vector_store(resume_text, resume_id)
+        # Save to ChromaDB for vector search
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        chunks = text_splitter.split_text(resume_text)
+        
+        # Add a unique ID for each chunk
+        chunk_ids = [f"{resume_id}_{i}" for i in range(len(chunks))]
+        metadatas = [{"source": resume_id, "user_id": user_id} for _ in chunks]
+        
+        vector_collection.add(
+            documents=chunks,
+            metadatas=metadatas,
+            ids=chunk_ids
+        )
         
         return {
             "message": "Resume processed successfully",
@@ -134,19 +145,52 @@ async def process_resume_endpoint(resume_file: UploadFile = File(...), user_id: 
             "resume_id": resume_id
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(e)
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {e}")
 
 @app.post("/api/chat")
 async def chat_endpoint(query: dict):
-    """API endpoint for chat and Q&A."""
+    """API endpoint for chat and Q&A using RAG."""
     user_query = query.get("query", "")
-    response_text = rag_query(user_query)
-    return {"response": response_text}
+    
+    if not vector_collection:
+        return {"response": "No resumes have been processed yet. Please upload a resume first."}
+
+    # Query ChromaDB for relevant documents
+    results = vector_collection.query(
+        query_texts=[user_query],
+        n_results=5,
+        include=['documents', 'metadatas']
+    )
+    
+    # Create documents for the prompt
+    retrieved_docs = [Document(page_content=doc, metadata=meta) for doc, meta in zip(results['documents'][0], results['metadatas'][0])]
+
+    llm = get_llm()
+    prompt = PromptTemplate.from_template("""
+    You are a helpful assistant who answers questions about resumes.
+    Use the following context to answer the user's question.
+    If you don't know the answer, just say you don't have enough information.
+    Context: {context}
+    Question: {input}
+    """)
+    
+    document_chain = create_stuff_documents_chain(llm, prompt)
+    response = document_chain.invoke({
+        "input": user_query,
+        "context": retrieved_docs
+    })
+    
+    return {"response": response}
+
 
 @app.get("/api/resumes/list")
 async def list_resumes_endpoint():
     """API endpoint to list all processed resumes."""
-    resumes_list = list(in_memory_db.values())
+    resumes_list = list(resumes_collection.find({}, {"_id": 1, "extracted_data.name": 1, "extracted_data.skills": 1}))
+    # Convert ObjectId to string for JSON serialization
+    for resume in resumes_list:
+        resume["_id"] = str(resume["_id"])
     return {"resumes": resumes_list}
 
 @app.post("/api/resumes/filter")
@@ -154,12 +198,31 @@ async def filter_resumes_endpoint(query: dict):
     """API endpoint to filter resumes based on a query using the LLM."""
     user_query = query.get("query", "")
     
+    # Query ChromaDB with the user's filter criteria
+    results = vector_collection.query(
+        query_texts=[user_query],
+        n_results=10, # Retrieve a reasonable number of candidates
+        include=['metadatas']
+    )
+    
+    # Get unique resume IDs from the search results
+    matching_ids = {meta['source'] for meta in results['metadatas'][0]}
+    
+    # Retrieve the full resumes from MongoDB
+    filtered_resumes = list(resumes_collection.find({"_id": {"$in": [pymongo.ObjectId(id) for id in matching_ids]}}))
+    
+    # Convert ObjectId to string for JSON serialization
+    for resume in filtered_resumes:
+        resume["_id"] = str(resume["_id"])
+
+    # Use the LLM to refine the list and select the best matches
+    # This acts as a reranker for better results
     llm = get_llm()
     
-    # Generate a list of all resumes as a single string for the prompt
-    resumes_string = "\n---\n".join([
-        f"ID: {r['id']}\nName: {r['extracted_data']['name']}\nSkills: {', '.join(r['extracted_data']['skills'])}\nSummary: {r['extracted_data']['summary']}"
-        for r in in_memory_db.values()
+    # Prepare the data for the LLM
+    candidate_resumes_string = "\n---\n".join([
+        f"ID: {r['_id']}\nName: {r['extracted_data']['name']}\nSkills: {', '.join(r['extracted_data']['skills'])}\nSummary: {r['extracted_data']['summary']}"
+        for r in filtered_resumes
     ])
     
     prompt = f"""
@@ -168,7 +231,7 @@ async def filter_resumes_endpoint(query: dict):
     If no resumes match, return an empty string.
 
     Resumes:
-    {resumes_string}
+    {candidate_resumes_string}
 
     Query: {user_query}
 
@@ -181,9 +244,10 @@ async def filter_resumes_endpoint(query: dict):
     if not matching_ids_str:
         return {"resumes": []}
     
-    matching_ids = [id.strip() for id in matching_ids_str.split(',') if id.strip()]
+    final_matching_ids = [id.strip() for id in matching_ids_str.split(',') if id.strip()]
     
-    # Retrieve the full resume objects for the matching IDs
-    filtered_resumes = [in_memory_db[id] for id in matching_ids if id in in_memory_db]
-    
-    return {"resumes": filtered_resumes}
+    # Fetch the final list of full resumes from the initial filtered set
+    final_filtered_resumes = [r for r in filtered_resumes if r["_id"] in final_matching_ids]
+
+    return {"resumes": final_filtered_resumes}
+
