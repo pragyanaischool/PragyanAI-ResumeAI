@@ -1,17 +1,7 @@
 import React, { useState, useEffect } from 'react';
 
-// Firebase imports for user ID management
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInWithCustomToken, signInAnonymously } from 'firebase/auth';
-import { getFirestore } from 'firebase/firestore';
-
 // Main App component
 const App = () => {
-  // Global variables provided by the environment
-  const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-  const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
-  const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
-
   // State management
   const [loading, setLoading] = useState(false);
   const [file, setFile] = useState(null);
@@ -24,38 +14,20 @@ const App = () => {
   const [showExtracted, setShowExtracted] = useState(false);
   const [showMarkdown, setShowMarkdown] = useState(false);
   const [showChat, setShowChat] = useState(false);
+  
+  // New state for listing and filtering resumes
+  const [filteredResumes, setFilteredResumes] = useState([]);
+  const [filterQuery, setFilterQuery] = useState('');
 
-  // Initialize Firebase on component mount
+  // Determine the backend URL.
+  // IMPORTANT: Replace 'https://your-backend-url.onrender.com' with your actual Render URL after deployment.
+  const backendUrl = 'https://your-backend-url.onrender.com';
+
+  // Generate a random user ID on component mount
   useEffect(() => {
-    if (Object.keys(firebaseConfig).length > 0) {
-      const app = initializeApp(firebaseConfig);
-      const auth = getAuth(app);
-      
-      const signIn = async () => {
-        try {
-          if (initialAuthToken) {
-            await signInWithCustomToken(auth, initialAuthToken);
-          } else {
-            await signInAnonymously(auth);
-          }
-        } catch (error) {
-          console.error("Firebase authentication error:", error);
-        }
-      };
-
-      signIn();
-
-      const unsubscribe = auth.onAuthStateChanged(user => {
-        if (user) {
-          setUserId(user.uid);
-        } else {
-          signInAnonymously(auth).then(anonUser => {
-            setUserId(anonUser.user.uid);
-          });
-        }
-      });
-      return () => unsubscribe();
-    }
+    // Generate a unique ID for the user
+    const uniqueId = crypto.randomUUID();
+    setUserId(uniqueId);
   }, []);
 
   // Handle file selection
@@ -80,8 +52,7 @@ const App = () => {
     formData.append('user_id', userId);
 
     try {
-      // The backend URL is http://localhost:8000
-      const response = await fetch('http://localhost:8000/api/process', {
+      const response = await fetch(`${backendUrl}/api/process`, {
         method: 'POST',
         body: formData,
       });
@@ -115,7 +86,7 @@ const App = () => {
     setStatusMessage('Getting response...');
 
     try {
-      const response = await fetch('http://localhost:8000/api/chat', {
+      const response = await fetch(`${backendUrl}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query: currentChat }),
@@ -133,6 +104,53 @@ const App = () => {
       console.error('Error with chat:', error);
       setChatHistory(prev => [...prev, { sender: 'ai', text: `Error: ${error.message}` }]);
       setStatusMessage('Chat error. See console for details.');
+    } finally {
+      setLoading(false);
+    }
+  };
+  
+  // Handle listing all resumes
+  const handleListAllResumes = async () => {
+    setLoading(true);
+    setStatusMessage('Fetching all resumes...');
+    try {
+      const response = await fetch(`${backendUrl}/api/resumes/list`);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      const data = await response.json();
+      setFilteredResumes(data.resumes);
+      setStatusMessage('All resumes fetched successfully!');
+    } catch (error) {
+      console.error('Error fetching resumes:', error);
+      setStatusMessage(`Error fetching resumes: ${error.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Handle filtering resumes based on query
+  const handleFilterResumes = async () => {
+    if (!filterQuery) return;
+    setLoading(true);
+    setStatusMessage('Filtering resumes...');
+    try {
+      const response = await fetch(`${backendUrl}/api/resumes/filter`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: filterQuery }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      setFilteredResumes(data.resumes);
+      setStatusMessage('Resumes filtered successfully!');
+    } catch (error) {
+      console.error('Error filtering resumes:', error);
+      setStatusMessage(`Error filtering resumes: ${error.message}`);
     } finally {
       setLoading(false);
     }
@@ -224,6 +242,48 @@ const App = () => {
             </div>
           </div>
         </section>
+        
+        {/* New section for listing and filtering resumes */}
+        <section className="bg-gray-800 p-8 rounded-2xl shadow-lg space-y-4">
+          <h2 className="text-3xl font-bold text-gray-200 text-center">Filter Resumes</h2>
+          <p className="text-gray-400 text-center">
+            List all resumes or use the AI to filter them based on skills, education, or other criteria. Example: "skills: Python, SQL" or "education: Computer Science".
+          </p>
+          <div className="flex flex-col sm:flex-row space-y-2 sm:space-y-0 sm:space-x-2">
+            <button onClick={handleListAllResumes} className="flex-1 px-4 py-3 bg-indigo-500 hover:bg-indigo-600 transition-colors duration-200 rounded-xl text-white font-semibold disabled:bg-gray-600 disabled:cursor-not-allowed">
+              List All Resumes
+            </button>
+            <div className="flex-1 flex flex-col space-y-2">
+              <input
+                type="text"
+                value={filterQuery}
+                onChange={(e) => setFilterQuery(e.target.value)}
+                onKeyPress={(e) => e.key === 'Enter' && handleFilterResumes()}
+                placeholder="e.g., skills: Python, SQL"
+                className="w-full p-3 rounded-xl bg-gray-700 border border-gray-600 text-gray-200 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                disabled={loading}
+              />
+              <button onClick={handleFilterResumes} disabled={loading || !filterQuery} className="w-full px-4 py-3 bg-indigo-500 hover:bg-indigo-600 transition-colors duration-200 rounded-xl text-white font-semibold disabled:bg-gray-600 disabled:cursor-not-allowed">
+                Filter Resumes
+              </button>
+            </div>
+          </div>
+          
+          <div className="mt-6 space-y-4">
+            {filteredResumes.length > 0 ? (
+              filteredResumes.map(resume => (
+                <div key={resume.id} className="bg-gray-700 p-4 rounded-xl shadow-inner">
+                  <h3 className="text-xl font-bold text-blue-400">{resume.extracted_data?.name || "Unknown"}</h3>
+                  <p className="text-sm text-gray-400 italic">ID: {resume.id}</p>
+                  <p className="text-sm mt-2 text-gray-300">Skills: {(resume.extracted_data?.skills || []).join(', ')}</p>
+                </div>
+              ))
+            ) : (
+              <p className="text-center text-gray-500 italic">No resumes to display. Upload a resume first or use the filter function.</p>
+            )}
+          </div>
+        </section>
+
         <p className="text-center text-xs text-gray-500">
           Your User ID is: {userId || 'Authenticating...'}
         </p>
