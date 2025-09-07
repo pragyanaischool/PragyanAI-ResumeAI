@@ -21,6 +21,9 @@ from llmprovider import get_llm
 from urllib.parse import quote_plus
 from dotenv import load_dotenv
 import uuid
+import urllib.parse
+import os # Assuming you're getting credentials from environment variables
+
 
 # Load environment variables from .env file for local testing
 # This line should be commented out or removed for production on Render
@@ -40,7 +43,20 @@ app.add_middleware(
 
 # --- Database & Vector Store Initialization ---
 # MongoDB Client
-mongo_uri = os.getenv("MONGO_URI")
+# Retrieve credentials, which might have special characters
+mongo_user = os.environ.get("MONGO_USER")
+mongo_pass = os.environ.get("MONGO_PASS")
+
+# URL-encode the username and password to handle special characters
+encoded_user = urllib.parse.quote_plus(mongo_user)
+encoded_pass = urllib.parse.quote_plus(mongo_pass)
+
+# Construct the URI with the encoded credentials
+mongo_uri = f"mongodb+srv://{encoded_user}:{encoded_pass}@your_cluster.mongodb.net/?retryWrites=true&w=majority"
+
+# Now, the pymongo client can connect without a URL parsing error
+#mongo_client = pymongo.MongoClient(mongo_uri)
+#mongo_uri = os.getenv("MONGO_URI")
 if not mongo_uri:
     raise ValueError("MONGO_URI environment variable not set.")
 mongo_client = pymongo.MongoClient(mongo_uri)
