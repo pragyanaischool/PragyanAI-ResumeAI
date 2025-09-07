@@ -13,7 +13,7 @@ python-docx
 PyPDF2
 httpx
 requests
-transformer
+transformers
 groq
 pymongo
 huggingface-hub
