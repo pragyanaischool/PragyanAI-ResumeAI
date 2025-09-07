@@ -17,7 +17,7 @@ import json
 import pymongo
 from chromadb import PersistentClient
 from chromadb.utils import embedding_functions
-from llm_provider import get_llm
+from llmprovider import get_llm
 from urllib.parse import quote_plus
 from dotenv import load_dotenv
 import uuid
