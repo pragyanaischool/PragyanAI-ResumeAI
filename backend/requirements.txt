@@ -11,6 +11,7 @@ chromadb
 uvicorn
 python-docx
 PyPDF2
+pypdf
 httpx
 requests
 transformers
