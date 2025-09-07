@@ -3,6 +3,7 @@ uvicorn[standard]
 langchain
 langchain-groq
 langchain-openai
+langchain-core
 langchain-community
 python-dotenv
 python-multipart
@@ -20,3 +21,6 @@ groq
 pymongo
 huggingface-hub
 sentence-transformers
+numpy
+faiss-cpu
+torch
