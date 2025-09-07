@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+langchain
+langchain-groq
+langchain-community
+python-dotenv
+tiktoken
+pydantic
+chromadb
+uvicorn
+python-docx
+PyPDF2
+httpx
+requests
+transformer
+groq
