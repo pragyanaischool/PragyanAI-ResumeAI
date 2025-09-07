@@ -1,0 +1,22 @@
+
+"name": "resume-ai-frontend",
+"version": "1.0.0",
+"description": "A web UI for the Resume AI Assistant",
+"scripts": {
+"start": "vite",
+"build": "vite build"
+},
+"dependencies": {
+"react": "^18.2.0",
+"react-dom": "^18.2.0",
+"axios": "^1.6.0",
+"uuid": "^9.0.1",
+"marked": "^11.0.0"
+},
+"devDependencies": {
+"vite": "^5.0.0"
+},
+"keywords": [],
+"author": "",
+"license": "ISC"
+}
