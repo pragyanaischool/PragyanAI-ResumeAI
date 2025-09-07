@@ -52,8 +52,7 @@ encoded_user = urllib.parse.quote_plus(mongo_user)
 encoded_pass = urllib.parse.quote_plus(mongo_pass)
 
 # Construct the URI with the encoded credentials
-mongo_uri = f"mongodb+srv://{encoded_user}:{encoded_pass}@your_cluster.mongodb.net/?retryWrites=true&w=majority"
-
+mongo_uri = f"mongodb+srv://{encoded_user}:{encoded_pass}@cluster0.d3fdjg3.mongodb.net/?retryWrites=true&w=majority"
 # Now, the pymongo client can connect without a URL parsing error
 #mongo_client = pymongo.MongoClient(mongo_uri)
 #mongo_uri = os.getenv("MONGO_URI")
