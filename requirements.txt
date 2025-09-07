@@ -4,6 +4,7 @@ langchain
 langchain-groq
 langchain-community
 python-dotenv
+python-multipart
 tiktoken
 pydantic
 chromadb
@@ -14,3 +15,6 @@ httpx
 requests
 transformer
 groq
+pymongo
+huggingface-hub
+sentence-transformers
