@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 langchain
 langchain-groq
+langchain-openai
 langchain-community
 python-dotenv
 python-multipart
