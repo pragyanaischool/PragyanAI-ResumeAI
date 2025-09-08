@@ -15,18 +15,15 @@ from langchain_core.documents import Document
 from langchain.chains import create_retrieval_chain
 import json
 import pymongo
+from pymongo import MongoClient
 from llmprovider import get_llm
 from urllib.parse import quote_plus
 from dotenv import load_dotenv
 import uuid
 import urllib.parse
-import numpy as np
-import faiss
-from transformers import AutoTokenizer, AutoModel
-import torch
+from bson.objectid import ObjectId
 
 # Load environment variables from .env file for local testing
-# This line should be commented out or removed for production on Render
 load_dotenv()
 
 app = FastAPI()
@@ -41,77 +38,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Global State and Client Initialization ---
-
+# --- Database & Vector Store Initialization ---
 # MongoDB Client
 mongo_user = os.environ.get("MONGO_USER")
 mongo_pass = os.environ.get("MONGO_PASS")
-
-encoded_user = urllib.parse.quote_plus(mongo_user)
-encoded_pass = urllib.parse.quote_plus(mongo_pass)
-
-mongo_uri = f"mongodb+srv://{encoded_user}:{encoded_pass}@cluster0.d3fdjg3.mongodb.net/?retryWrites=true&w=majority"
+mongo_uri = f"mongodb+srv://{urllib.parse.quote_plus(mongo_user)}:{urllib.parse.quote_plus(mongo_pass)}@cluster0.d3fdjg3.mongodb.net/?retryWrites=true&w=majority"
 if not mongo_uri:
     raise ValueError("MONGO_URI environment variable not set.")
 mongo_client = pymongo.MongoClient(mongo_uri)
 db = mongo_client["resume_db"]
 resumes_collection = db["resumes"]
+vector_store_collection = db["resume_vectors"]
 
-# FAISS and Embedding Model
-device = "cuda" if torch.cuda.is_available() else "cpu"
-tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
-model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2").to(device)
-
-def get_embedding(texts):
-    """Generates embeddings for a list of texts using the Hugging Face model."""
-    inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(device)
-    with torch.no_grad():
-        embeddings = model(**inputs).last_hidden_state.mean(dim=1)
-    return embeddings.cpu().numpy()
-
-class VectorIndex:
-    def __init__(self, d: int = 384, index_file: str = "faiss_index.bin"):
-        self.d = d
-        self.index_file = index_file
-        self.index = None
-        self.doc_ids = []
-
-    def load_index(self):
-        """Loads the FAISS index from a file if it exists, otherwise creates a new one."""
-        if os.path.exists(self.index_file):
-            print(f"Loading existing FAISS index from {self.index_file}...")
-            self.index = faiss.read_index(self.index_file)
-            # You would also need to load doc_ids, but for this example, we'll keep it simple
-            # and assume a new index for each restart. For true persistence, you would
-            # also save and load the doc_ids.
-            print("FAISS index loaded.")
-        else:
-            print("Creating new FAISS index.")
-            self.index = faiss.IndexFlatL2(self.d)
-
-    def save_index(self):
-        """Saves the FAISS index to a file."""
-        print(f"Saving FAISS index to {self.index_file}...")
-        faiss.write_index(self.index, self.index_file)
-        print("FAISS index saved.")
-
-    def add_vectors(self, vectors: np.ndarray, doc_ids: list):
-        """Adds vectors and their corresponding document IDs to the index."""
-        self.index.add(vectors)
-        self.doc_ids.extend(doc_ids)
-
-    def search_vectors(self, query_vectors: np.ndarray, k: int = 5):
-        """Performs a search for the top-k nearest neighbors."""
-        distances, indices = self.index.search(query_vectors, k)
-        return distances, [self.doc_ids[i] for i in indices[0]]
-
-# Initialize FAISS index globally
-vector_index = VectorIndex(d=384, index_file="faiss_index.bin")
+# Embedding Function
+hf_api_key = os.getenv("HF_API_KEY")
+if not hf_api_key:
+    raise ValueError("HF_API_KEY environment variable not set.")
+huggingface_ef = embedding_functions.HuggingFaceEmbeddingFunction(
+    api_key=hf_api_key,
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
 
 # --- Lifespan Context Manager ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # MongoDB connection check
     try:
         mongo_client.admin.command('ping')
         print("MongoDB connection successful!")
@@ -119,13 +69,41 @@ async def lifespan(app: FastAPI):
         print(f"MongoDB connection failed: {e}")
         raise RuntimeError("MongoDB connection is required for the application to function.")
 
-    # Load FAISS index on startup
-    vector_index.load_index()
-
     yield
     mongo_client.close()
 
 # --- Helper Functions ---
+def _vector_search_mongodb(query_text: str, n_results: int = 5):
+    """Performs a vector search on MongoDB."""
+    embedding = huggingface_ef(query_text)
+    
+    pipeline = [
+        {
+            "$vectorSearch": {
+                "index": "vector_index",
+                "path": "embedding",
+                "queryVector": embedding,
+                "numCandidates": 150,
+                "limit": n_results
+            }
+        },
+        {
+            "$project": {
+                "document": 1,
+                "metadata": 1,
+                "score": { "$meta": "vectorSearchScore" }
+            }
+        }
+    ]
+    
+    results = list(vector_store_collection.aggregate(pipeline))
+    
+    retrieved_docs = []
+    for res in results:
+        retrieved_docs.append(Document(page_content=res['document'], metadata=res['metadata']))
+        
+    return retrieved_docs
+
 def extract_text_from_file(file: UploadFile) -> str:
     """Extracts text from a given file based on its content type."""
     content_type = file.content_type
@@ -184,15 +162,23 @@ async def process_resume_endpoint(resume_file: UploadFile = File(...), user_id: 
         result = resumes_collection.insert_one(resume_doc)
         resume_id = str(result.inserted_id)
         
-        # Save to FAISS for vector search
+        # Split text and generate embeddings
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         chunks = text_splitter.split_text(resume_text)
         
-        chunk_embeddings = get_embedding(chunks)
-        chunk_ids = [f"{resume_id}_{i}" for i in range(len(chunks))]
+        # Prepare documents for MongoDB vector store
+        documents_to_insert = []
+        for i, chunk in enumerate(chunks):
+            embedding = huggingface_ef(chunk)
+            documents_to_insert.append({
+                "document": chunk,
+                "metadata": {"source": resume_id, "user_id": user_id, "chunk_id": i},
+                "embedding": embedding
+            })
         
-        vector_index.add_vectors(chunk_embeddings, chunk_ids)
-        vector_index.save_index() # Save the index after adding data
+        # Insert documents into the MongoDB vector store
+        if documents_to_insert:
+            vector_store_collection.insert_many(documents_to_insert)
         
         return {
             "message": "Resume processed successfully",
@@ -209,28 +195,9 @@ async def chat_endpoint(query: dict):
     """API endpoint for chat and Q&A using RAG."""
     user_query = query.get("query", "")
     
-    if vector_index.index is None or vector_index.index.ntotal == 0:
-        return {"response": "No resumes have been processed yet. Please upload a resume first."}
-        
-    # Get embedding for the query
-    query_embedding = get_embedding([user_query])
-
-    # Query FAISS for relevant documents
-    distances, matching_ids = vector_index.search_vectors(query_embedding, k=5)
+    # Query MongoDB for relevant documents using vector search
+    retrieved_docs = _vector_search_mongodb(user_query, n_results=5)
     
-    # Retrieve the full resume documents from MongoDB based on chunk IDs
-    retrieved_docs_text = []
-    
-    # Find unique resume IDs from the matched chunks
-    unique_resume_ids = list(set([_id.split('_')[0] for _id in matching_ids]))
-    
-    for resume_id in unique_resume_ids:
-        doc = resumes_collection.find_one({"_id": pymongo.ObjectId(resume_id)})
-        if doc:
-            retrieved_docs_text.append(doc['original_text'])
-
-    retrieved_docs = [Document(page_content=text) for text in retrieved_docs_text]
-
     llm = get_llm()
     prompt = PromptTemplate.from_template("""
     You are a helpful assistant who answers questions about resumes.
@@ -262,20 +229,14 @@ async def filter_resumes_endpoint(query: dict):
     """API endpoint to filter resumes based on a query using the LLM."""
     user_query = query.get("query", "")
     
-    # Get embedding for the query
-    query_embedding = get_embedding([user_query])
-    
-    if vector_index.index is None or vector_index.index.ntotal == 0:
-        return {"resumes": []}
-    
-    # Query FAISS for relevant documents
-    distances, matching_chunk_ids = vector_index.search_vectors(query_embedding, k=10)
+    # Query MongoDB with the user's filter criteria using vector search
+    retrieved_docs = _vector_search_mongodb(user_query, n_results=10)
     
     # Get unique resume IDs from the search results
-    matching_ids = {chunk_id.split('_')[0] for chunk_id in matching_chunk_ids}
+    matching_ids = {doc.metadata['source'] for doc in retrieved_docs}
     
     # Retrieve the full resumes from MongoDB
-    filtered_resumes = list(resumes_collection.find({"_id": {"$in": [pymongo.ObjectId(id) for id in matching_ids]}}))
+    filtered_resumes = list(resumes_collection.find({"_id": {"$in": [ObjectId(id) for id in matching_ids]}}))
     
     # Convert ObjectId to string for JSON serialization
     for resume in filtered_resumes:
