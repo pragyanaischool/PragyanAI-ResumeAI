@@ -8,21 +8,19 @@ from io import BytesIO
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage
 from langchain.prompts import PromptTemplate
-from langchain_community.document_loaders import TextLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.documents import Document
-from langchain.chains import create_retrieval_chain
-import json
-import pymongo
-from pymongo import MongoClient
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from llmprovider import get_llm
 from urllib.parse import quote_plus
 from dotenv import load_dotenv
 import uuid
-import urllib.parse
 from bson.objectid import ObjectId
+import json
+import pymongo
+from pymongo import MongoClient
+import urllib.parse
+from langchain.chains.combine_documents import create_stuff_documents_chain
 
 # Load environment variables from .env file for local testing
 load_dotenv()
@@ -52,10 +50,7 @@ resumes_collection = db["resumes"]
 vector_store_collection = db["resume_vectors"]
 
 # Embedding Function
-hf_api_key = os.getenv("HF_API_KEY")
-if not hf_api_key:
-    raise ValueError("HF_API_KEY environment variable not set.")
-huggingface_ef = HuggingFaceEmbeddings(
+embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2",
 )
 
@@ -75,7 +70,7 @@ async def lifespan(app: FastAPI):
 # --- Helper Functions ---
 def _vector_search_mongodb(query_text: str, n_results: int = 5):
     """Performs a vector search on MongoDB."""
-    embedding = huggingface_ef.embed_query(query_text)
+    embedding = embedding_model.embed_query(query_text)
     
     pipeline = [
         {
@@ -169,7 +164,7 @@ async def process_resume_endpoint(resume_file: UploadFile = File(...), user_id: 
         # Prepare documents for MongoDB vector store
         documents_to_insert = []
         for i, chunk in enumerate(chunks):
-            embedding = huggingface_ef.embed_query(chunk)
+            embedding = embedding_model.embed_query(chunk)
             documents_to_insert.append({
                 "document": chunk,
                 "metadata": {"source": resume_id, "user_id": user_id, "chunk_id": i},
