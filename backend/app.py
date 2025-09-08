@@ -16,6 +16,7 @@ from langchain.chains import create_retrieval_chain
 import json
 import pymongo
 from pymongo import MongoClient
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from llmprovider import get_llm
 from urllib.parse import quote_plus
 from dotenv import load_dotenv
@@ -54,9 +55,8 @@ vector_store_collection = db["resume_vectors"]
 hf_api_key = os.getenv("HF_API_KEY")
 if not hf_api_key:
     raise ValueError("HF_API_KEY environment variable not set.")
-huggingface_ef = embedding_functions.HuggingFaceEmbeddingFunction(
-    api_key=hf_api_key,
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
+huggingface_ef = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
 )
 
 # --- Lifespan Context Manager ---
@@ -75,7 +75,7 @@ async def lifespan(app: FastAPI):
 # --- Helper Functions ---
 def _vector_search_mongodb(query_text: str, n_results: int = 5):
     """Performs a vector search on MongoDB."""
-    embedding = huggingface_ef(query_text)
+    embedding = huggingface_ef.embed_query(query_text)
     
     pipeline = [
         {
@@ -169,7 +169,7 @@ async def process_resume_endpoint(resume_file: UploadFile = File(...), user_id: 
         # Prepare documents for MongoDB vector store
         documents_to_insert = []
         for i, chunk in enumerate(chunks):
-            embedding = huggingface_ef(chunk)
+            embedding = huggingface_ef.embed_query(chunk)
             documents_to_insert.append({
                 "document": chunk,
                 "metadata": {"source": resume_id, "user_id": user_id, "chunk_id": i},
